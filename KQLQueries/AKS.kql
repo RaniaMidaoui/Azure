@@ -1,0 +1,182 @@
+// This file contains all the KQL queries that I wrote or found useful when setting up a Log Analytics Workspace for the AKS cluster of my end of year project. 
+
+
+// See container logs for ingress-nginx namespace
+let TimeDur = 3d; 
+ContainerLog
+|join(KubePodInventory | where TimeGenerated > startofday(ago(TimeDur)))
+on ContainerID
+|where TimeGenerated > startofday(ago(TimeDur))
+|summarize by LogEntry,ContainerID, Namespace, ClusterId, TimeGenerated1, PodUid, ServiceName
+|where Namespace has "ingress"
+
+
+// See container logs for default namespace for the last 3 days
+let TimeDur = 3d; 
+ContainerLog
+|join(KubePodInventory | where TimeGenerated > startofday(ago(TimeDur)))
+on ContainerID
+|where TimeGenerated > startofday(ago(TimeDur))
+|summarize by LogEntry,ContainerID, Namespace, ClusterId, TimeGenerated1, PodUid, ServiceName
+|where Namespace has "ingress"
+
+
+// View container logs from all the namespaces in the cluster. 
+ContainerLog
+|where TimeGenerated > startofday(ago(1h))
+|join(
+KubePodInventory
+| where TimeGenerated > startofday(ago(1h)) 
+| distinct Computer, ContainerID, Namespace
+)//KubePodInventory Contains namespace information
+on Computer, ContainerID
+| project TimeGenerated, ContainerID, Namespace , LogEntrySource , LogEntry
+
+
+//Billable Log Data per-namespace 
+// See container logs billable data for the last 7d, segregated by namespace. 
+let billableTimeView = 7d; // Set the requested time - 30d can take some time. 
+ContainerLog
+|join(KubePodInventory | where TimeGenerated > startofday(ago(billableTimeView)))
+on ContainerID
+|where TimeGenerated > startofday(ago(billableTimeView))
+| summarize Total=sum(_BilledSize)/ 1000 by bin(TimeGenerated, 1d), Namespace
+
+
+// List Container LifeCycle information
+ContainerInventory
+| project Computer, Name, Image, ImageTag, ContainerState, CreatedTime, StartedTime, FinishedTime
+
+
+// List Pods by name and namespace
+let startTimestamp = ago(1d);
+KubePodInventory
+| where TimeGenerated > startTimestamp
+| project ContainerID, PodName=Name, Namespace
+| where PodName contains "name" and Namespace startswith "namespace"
+| distinct ContainerID, PodName
+| join
+(
+    ContainerLog
+    | where TimeGenerated > startTimestamp
+)
+on ContainerID
+| project TimeGenerated, PodName, LogEntry, LogEntrySource
+| summarize by TimeGenerated, LogEntry
+| order by TimeGenerated desc
+
+
+// Get the umber of active nodes in each node pool
+let nodepoolMaxnodeCount = 10; // the maximum number of nodes in your auto scale setting goes here.
+let _minthreshold = 20;
+let _maxthreshold = 90;
+let startDateTime = 60m;
+KubeNodeInventory
+| where TimeGenerated >= ago(startDateTime)
+| extend nodepoolType = todynamic(Labels) //Parse the labels to get the list of node pool types
+| extend nodepoolName = todynamic(nodepoolType[0].agentpool) // parse the label to get the nodepool name or set the specific nodepool name (like nodepoolName = 'agentpool)'
+| summarize nodeCount = count(Computer) by ClusterName, tostring(nodepoolName), TimeGenerated
+| summarize arg_max(TimeGenerated, *) by nodeCount, ClusterName, tostring(nodepoolName)
+| project ClusterName, 
+    TotalNodeCount= strcat("Total Node Count: ", nodeCount),
+    ScaledOutPercentage = (nodeCount * 100 / nodepoolMaxnodeCount),  
+    TimeGenerated, 
+    nodepoolName
+
+
+// Get the system containers (replicasets) and reports the unavailable percentage
+let startDateTime = 5m; // the minimum time interval goes here
+let _minalertThreshold = 50; //Threshold for minimum and maximum unavailable or not running containers
+let _maxalertThreshold = 70;
+KubePodInventory
+| where TimeGenerated >= ago(startDateTime)
+| distinct ClusterName, TimeGenerated
+| summarize Clustersnapshot = count() by ClusterName
+| join kind=inner (
+    KubePodInventory
+    | where TimeGenerated >= ago(startDateTime)
+    | where Namespace in('default', 'kube-system') and ControllerKind == 'ReplicaSet' // the system namespace filter goes here
+    | distinct ClusterName, Computer, PodUid, TimeGenerated, PodStatus, ServiceName, PodLabel, Namespace, ContainerStatus
+    | summarize arg_max(TimeGenerated, *), TotalPODCount = count(), podCount = sumif(1, PodStatus == 'Running' or PodStatus != 'Running'), containerNotrunning = sumif(1, ContainerStatus != 'running')
+        by ClusterName, TimeGenerated, ServiceName, PodLabel, Namespace
+    )
+    on ClusterName
+| project ClusterName, ServiceName, podCount, containerNotrunning, containerNotrunningPercent = (containerNotrunning * 100 / podCount), TimeGenerated, PodStatus, PodLabel, Namespace, Environment = tostring(split(ClusterName, '-')[3]), Location = tostring(split(ClusterName, '-')[4]), ContainerStatus
+//Uncomment the below line to set for automated alert
+//| where PodStatus == "Running" and containerNotrunningPercent > _minalertThreshold and containerNotrunningPercent < _maxalertThreshold
+| summarize arg_max(TimeGenerated, *), c_entry=count() by PodLabel, ServiceName, ClusterName
+//Below lines are to parse the labels to identify the impacted service/component name
+| extend parseLabel = replace(@'k8s-app', @'k8sapp', PodLabel)
+| extend parseLabel = replace(@'app.kubernetes.io\\/component', @'appkubernetesiocomponent', parseLabel)
+| extend parseLabel = replace(@'app.kubernetes.io\\/instance', @'appkubernetesioinstance', parseLabel)
+| extend tags = todynamic(parseLabel)
+| extend tag01 = todynamic(tags[0].app)
+| extend tag02 = todynamic(tags[0].k8sapp)
+| extend tag03 = todynamic(tags[0].appkubernetesiocomponent)
+| extend tag04 = todynamic(tags[0].aadpodidbinding)
+| extend tag05 = todynamic(tags[0].appkubernetesioinstance)
+| extend tag06 = todynamic(tags[0].component)
+| project ClusterName, TimeGenerated,
+    ServiceName = strcat( ServiceName, tag01, tag02, tag03, tag04, tag05, tag06),
+    ContainerUnavailable = strcat("Unavailable Percentage: ", containerNotrunningPercent),
+    PodStatus = strcat("PodStatus: ", PodStatus), 
+    ContainerStatus = strcat("Container Status: ", ContainerStatus)
+    
+
+// Get the system containers (daemonsets) and reports the unavailable percentage
+let startDateTime = 5m; // the minimum time interval goes here
+let _minalertThreshold = 50; //Threshold for minimum and maximum unavailable or not running containers
+let _maxalertThreshold = 70;
+KubePodInventory
+| where TimeGenerated >= ago(startDateTime)
+| distinct ClusterName, TimeGenerated
+| summarize Clustersnapshot = count() by ClusterName
+| join kind=inner (
+    KubePodInventory
+    | where TimeGenerated >= ago(startDateTime)
+    | where Namespace in('default', 'kube-system') and ControllerKind == 'DaemonSet' // the system namespace filter goes here
+    | distinct ClusterName, Computer, PodUid, TimeGenerated, PodStatus, ServiceName, PodLabel, Namespace, ContainerStatus
+    | summarize arg_max(TimeGenerated, *), TotalPODCount = count(), podCount = sumif(1, PodStatus == 'Running' or PodStatus != 'Running'), containerNotrunning = sumif(1, ContainerStatus != 'running')
+        by ClusterName, TimeGenerated, ServiceName, PodLabel, Namespace
+    )
+    on ClusterName
+| project ClusterName, ServiceName, podCount, containerNotrunning, containerNotrunningPercent = (containerNotrunning * 100 / podCount), TimeGenerated, PodStatus, PodLabel, Namespace, Environment = tostring(split(ClusterName, '-')[3]), Location = tostring(split(ClusterName, '-')[4]), ContainerStatus
+//Uncomment the below line to set for automated alert
+//| where PodStatus == "Running" and containerNotrunningPercent > _minalertThreshold and containerNotrunningPercent < _maxalertThreshold
+| summarize arg_max(TimeGenerated, *), c_entry=count() by PodLabel, ServiceName, ClusterName
+//Below lines are to parse the labels to identify the impacted service/component name
+| extend parseLabel = replace(@'k8s-app', @'k8sapp', PodLabel)
+| extend parseLabel = replace(@'app.kubernetes.io\\/component', @'appkubernetesiocomponent', parseLabel)
+| extend parseLabel = replace(@'app.kubernetes.io\\/instance', @'appkubernetesioinstance', parseLabel)
+| extend tags = todynamic(parseLabel)
+| extend tag01 = todynamic(tags[0].app)
+| extend tag02 = todynamic(tags[0].k8sapp)
+| extend tag03 = todynamic(tags[0].appkubernetesiocomponent)
+| extend tag04 = todynamic(tags[0].aadpodidbinding)
+| extend tag05 = todynamic(tags[0].appkubernetesioinstance)
+| extend tag06 = todynamic(tags[0].component)
+| project ClusterName, TimeGenerated,
+    ServiceName = strcat( ServiceName, tag01, tag02, tag03, tag04, tag05, tag06),
+    ContainerUnavailable = strcat("Unavailable Percentage: ", containerNotrunningPercent),
+    PodStatus = strcat("PodStatus: ", PodStatus), 
+    ContainerStatus = strcat("Container Status: ", ContainerStatus)
+    
+// Get Cluster autoscaler logs for scaling up or scaling down
+AzureDiagnostics
+| where Category == "cluster-autoscaler" and ( log_s contains "scale up" or log_s contains "scale down" )
+
+
+// Audit
+AzureDiagnostics
+| where Category == "kube-audit"
+| extend logs = parse_json(log_s)
+| where logs.verb == "delete"
+| project TimeGenerated, logs.kind, logs.level, logs.verb, logs
+
+AzureDiagnostics
+| where Category == "kube-audit"
+| where TimeGenerated > ago(24h)
+| extend verb_ = tostring(parse_json(log_s).verb)
+| summarize count() by verb_
+| project count_, verb_
+| render piechart
